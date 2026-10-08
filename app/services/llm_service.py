@@ -1,55 +1,133 @@
+"""Provider-agnostic LLM interface.
+
+The chat service only knows the `LLMProvider` interface and the `LLMError`
+family. Each provider translates its own SDK errors into these, so error
+handling does not depend on which model vendor is configured.
+"""
+from __future__ import annotations
+
 import logging
-import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Literal
 
-from dotenv import load_dotenv
+from app.config import Settings
 
-from app.prompts.system_prompt import SYSTEM_PROMPT
-
-load_dotenv()
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-flash-latest"
-FALLBACK_REPLY = "Sorry, the AI service is temporarily unavailable."
+Role = Literal["user", "assistant"]
 
 
-def _build_prompt(message: str, context: dict | None, chunks: list[dict] | None) -> str:
-    parts = []
-    if context:
-        parts.append(f"CONTEXT:\n{context}")
-    if chunks:
-        knowledge = "\n".join(f"- ({c.get('source', 'unknown')}) {c.get('text', '')}" for c in chunks)
-        parts.append(f"KNOWLEDGE:\n{knowledge}")
-    parts.append(f"USER MESSAGE:\n{message}")
-    return "\n\n".join(parts)
+@dataclass(frozen=True)
+class ChatMessage:
+    role: Role
+    content: str
 
 
-def generate_reply(message: str, context: dict | None = None, chunks: list[dict] | None = None) -> tuple[str, bool]:
-    """Return (reply_text, ok).
+class LLMError(Exception):
+    """Base error. `code` is a stable, safe-to-log identifier."""
 
-    - No API key set  -> mock reply (so the prototype always runs).
-    - Model call fails -> safe fallback text, only the error type/code is logged.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return f"[mock] You said: {message}", True
+    code = "provider_error"
 
-    try:
+
+class LLMTimeoutError(LLMError):
+    code = "timeout"
+
+
+class LLMRateLimitError(LLMError):
+    code = "rate_limited"
+
+
+class LLMProviderError(LLMError):
+    code = "provider_error"
+
+
+class LLMResponseError(LLMError):
+    """The provider answered, but the answer was empty or malformed."""
+
+    code = "bad_response"
+
+
+class LLMProvider(ABC):
+    name: str
+
+    @abstractmethod
+    def generate(self, system_prompt: str, messages: list[ChatMessage], timeout: float) -> str:
+        """Return the assistant reply text, or raise an LLMError subclass."""
+
+
+class MockProvider(LLMProvider):
+    """Used when no API key is configured, so the service always runs."""
+
+    name = "mock"
+
+    def generate(self, system_prompt: str, messages: list[ChatMessage], timeout: float) -> str:
+        last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+        return f"[mock] You said: {last_user}"
+
+
+class GeminiProvider(LLMProvider):
+    name = "gemini"
+
+    def __init__(self, api_key: str, model: str):
+        self._api_key = api_key
+        self._model = model
+
+    def generate(self, system_prompt: str, messages: list[ChatMessage], timeout: float) -> str:
+        import httpx
         from google import genai
-        from google.genai import types
+        from google.genai import errors, types
 
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", DEFAULT_MODEL),
-            contents=_build_prompt(message, context, chunks),
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-        )
-        return (response.text or "I could not generate a reply."), True
-    except Exception as exc:  # noqa: BLE001
-        # Log error type, HTTP code and status only. Never log the key.
-        logger.error(
-            "LLM call failed: %s code=%s status=%s",
-            type(exc).__name__,
-            getattr(exc, "code", ""),
-            getattr(exc, "status", ""),
-        )
-        return FALLBACK_REPLY, False
+        try:
+            client = genai.Client(
+                api_key=self._api_key,
+                http_options=types.HttpOptions(timeout=int(timeout * 1000)),  # milliseconds
+            )
+            contents = [
+                types.Content(
+                    role="user" if m.role == "user" else "model",
+                    parts=[types.Part(text=m.content)],
+                )
+                for m in messages
+            ]
+            response = client.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+        except errors.APIError as exc:
+            code = getattr(exc, "code", None)
+            status = getattr(exc, "status", None)
+            # Only the type, HTTP code and status go into the message: no body, no key.
+            detail = f"{type(exc).__name__} code={code} status={status}"
+            if code == 429:
+                raise LLMRateLimitError(detail) from None
+            if code in (408, 504):
+                raise LLMTimeoutError(detail) from None
+            raise LLMProviderError(detail) from None
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            raise LLMTimeoutError(type(exc).__name__) from None
+        except Exception as exc:  # noqa: BLE001 - never let an SDK error escape raw
+            raise LLMProviderError(type(exc).__name__) from None
+
+        text = getattr(response, "text", None)
+        if not isinstance(text, str) or not text.strip():
+            raise LLMResponseError("empty or malformed response")
+        return text.strip()
+
+
+def get_provider(settings: Settings) -> LLMProvider:
+    choice = settings.llm_provider
+    if choice == "mock":
+        return MockProvider()
+    if choice in ("gemini", "auto"):
+        if settings.gemini_api_key:
+            return GeminiProvider(settings.gemini_api_key, settings.gemini_model)
+        if choice == "gemini":
+            logger.warning("LLM_PROVIDER=gemini but GEMINI_API_KEY is not set; using mock provider")
+        return MockProvider()
+    logger.warning("Unknown LLM_PROVIDER value; using mock provider")
+    return MockProvider()

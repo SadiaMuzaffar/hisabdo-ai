@@ -2,7 +2,7 @@
 
 **Date:** October 5, 2026
 **Scope:** System design, RAG/Knowledge Base, Workflows/Agents, API prototype, Evaluation
-**Stack (prototype):** Python 3, FastAPI, Uvicorn, Google Gemini (via `google-genai`)
+**Stack (prototype):** Python 3, FastAPI, Uvicorn, Google Gemini (via `google-genai`), behind a provider-agnostic LLM interface
 
 > **Status legend:** ✅ Implemented in the prototype · 🟡 Designed, planned for next phases
 
@@ -39,13 +39,17 @@ Web/Mobile Client
 
 | Component | File | Status |
 |---|---|---|
-| API entry and routing | `app/main.py`, `app/api/chat.py` | ✅ |
-| LLM call and prompt assembly | `app/services/llm_service.py` | ✅ |
+| API entry, routing, error handlers | `app/main.py`, `app/api/chat.py` | ✅ |
+| Chat service (orchestration, fallbacks) | `app/services/chat_service.py` | ✅ |
+| LLM provider interface + Gemini + mock | `app/services/llm_service.py` | ✅ (Gemini call blocked by a Google project 403, see 3.4) |
+| Conversation history store | `app/services/conversation_store.py` | ✅ in-memory |
+| Settings (env variables) | `app/config.py` | ✅ |
+| Structured JSON logging | `app/logging_config.py` | ✅ |
 | System prompt | `app/prompts/system_prompt.py` | ✅ |
 | Context Builder | `app/services/context_service.py` | 🟡 minimal (id only) |
 | Knowledge Base | `app/services/kb_service.py` | 🟡 placeholder |
 | RAG retrieval | `app/services/rag_service.py` | 🟡 placeholder (returns no chunks) |
-| Evaluation / safe logging | `app/services/evaluation_service.py` | ✅ basic logging |
+| Evaluation hooks | `app/services/evaluation_service.py` | 🟡 placeholder (operational logging lives in the chat service) |
 | Agent / workflow layer | (future `app/agents/`) | 🟡 |
 
 ---
@@ -62,15 +66,40 @@ A business-focused conversational service. It receives a user request, determine
 User Request → Chat API → Request Validation → Context Builder → KB/RAG → AI Model → Response → Logging/Evaluation
 ```
 
-1. **Receive and validate** the request (`conversation_id` 1–100 chars; `message` 1–4000 chars, not blank). Invalid input returns **HTTP 422** with a clear error. ✅
-2. **Identify** the conversation and user.
-3. **Build context** (only what is relevant and authorized).
-4. **Retrieve** KB content when needed (RAG).
-5. **Send** system instructions + context + retrieved chunks + user message to the model. ✅
-6. **Return** a structured response `{conversation_id, message}`. ✅
-7. **Record** safe operational logs (ids, lengths, outcome; never keys or full content). ✅
+1. **Validate** the request. `conversation_id` is 1 to 100 characters and `message` is 1 to 4000 characters. Both must be non-blank. Invalid input returns **HTTP 422** and never reaches the model. ✅
+2. **Build the LLM payload** in `ChatService`: the HisabDo system prompt, the stored history of this conversation (last 20 messages by default), and the current user message. Context and knowledge chunks are appended to the system prompt only when they exist. ✅
+3. **Call the provider** through the `LLMProvider` interface with a configured timeout (default 20 seconds). The service never imports a vendor SDK. ✅
+4. **Normalize** the reply: trim it, and treat an empty or malformed reply as an error. ✅
+5. **Persist** the finished turn (user message and reply) in the conversation store, and log safe metadata. Failed turns are **not** stored, so history stays consistent. ✅
+6. **Respond** with the stable schema below. On failure, return a clear fallback message. ✅
 
-**Failure behaviour:** if the model call fails, the API still returns HTTP 200 with a safe fallback message ("Sorry, the AI service is temporarily unavailable.") and logs only the error type, HTTP code and status. No key or request body is logged. If no API key is configured, the service returns a clearly marked `[mock]` reply so the prototype always runs. ✅
+**Response schema** (always the same shape):
+
+```json
+{ "conversation_id": "conv_001", "message": "...", "status": "ok", "error_code": null }
+```
+
+`status` is `"ok"` or `"fallback"`. When it is `"fallback"`, `error_code` says why and `message` holds a user-safe text.
+
+### 3.2.1 Error handling
+
+| Failure | Provider error class | `error_code` | HTTP | User-facing message |
+|---|---|---|---|---|
+| Request invalid | (FastAPI validation) | none | 422 | Validation detail, no stack trace |
+| Provider timeout | `LLMTimeoutError` | `timeout` | 200 | "The AI service took too long to respond. Please try again." |
+| Rate limit (provider 429) | `LLMRateLimitError` | `rate_limited` | 200 | "The AI service is busy right now. Please try again in a moment." |
+| Provider error (4xx/5xx, network, bad key, blocked project) | `LLMProviderError` | `provider_error` | 200 | "Sorry, the AI service is temporarily unavailable." |
+| Empty or malformed reply | `LLMResponseError` | `bad_response` | 200 | "Sorry, I could not produce a valid reply. Please try again." |
+| Bug inside a provider | any other exception | `provider_error` | 200 | same as provider error |
+| Bug elsewhere in the app | unhandled | none | 500 | `{"detail": "Internal server error"}` |
+
+Each provider translates its own SDK errors into the `LLMError` family, so this table does not change when a different vendor is added. No retries are done in the prototype; automatic retry with backoff for rate limits is a planned improvement.
+
+If no API key is configured, the service uses a `MockProvider` that returns `[mock] You said: ...`, so the prototype always runs.
+
+### 3.2.2 Structured logging
+
+Every chat request writes one JSON log line, `chat_completed` or `chat_failed`, with: `conversation_id`, `provider`, `latency_ms`, `history_messages`, `request_chars`, and either `reply_chars` or `error_code`. Invalid requests write `request_invalid` with the names of the failing fields. **Logs never contain API keys, message text, replies, provider response bodies or exception messages.** Tests check this.
 
 ### 3.3 Context Handling
 
@@ -87,8 +116,15 @@ User Request → Chat API → Request Validation → Context Builder → KB/RAG 
 
 - Send only relevant context to the model (token cost, privacy, answer quality).
 - Check authorization **before** adding any business or customer data.
-- Conversation history is trimmed to the most recent messages that fit a token budget (proposed: last 10 messages or about 2,000 tokens, whichever is smaller).
+- Conversation history is kept per `conversation_id` and trimmed to the most recent messages (default 20, set with `HISTORY_MAX_MESSAGES`). The store keeps at most 1,000 conversations and drops the least recently used. It is in-memory in the prototype, so history is lost on restart. A database-backed store would implement the same two methods (`history`, `append_exchange`).
+- A token-based budget for history is planned.
 - Never include unrelated users' data or credentials in the prompt.
+
+### 3.4 Known limitation: Gemini project access
+
+The real Gemini reply is not demonstrated yet. The developer's Google project was refused with `403 PERMISSION_DENIED: Your project has been denied access. Please contact support.` The provider code and its failure handling are tested, and the service returns a clear fallback in this case.
+
+Google also reported that `gemini-2.5-flash` is no longer available to new users and recommended `gemini-3.8-flash`, which is now the default model name. That replacement could not be verified because of the block. A working key from the company is needed to confirm it.
 
 ---
 
@@ -190,25 +226,34 @@ Understand Request → Classify/Route → Gather Context → Retrieve Knowledge 
 
 **Response (200)**
 ```json
-{ "conversation_id": "conv_001", "message": "I can help with business questions, tasks, summaries, and other supported business activities." }
+{ "conversation_id": "conv_001", "message": "I can help with business questions, tasks, summaries, and other supported business activities.", "status": "ok", "error_code": null }
 ```
 
-**Validation error (422):** returned for an empty or blank `message`, missing or empty `conversation_id`, missing fields, or a message over 4,000 characters.
+**Provider failure (200, fallback):**
+```json
+{ "conversation_id": "conv_001", "message": "The AI service took too long to respond. Please try again.", "status": "fallback", "error_code": "timeout" }
+```
+
+**Validation error (422):** returned for an empty or blank `message` or `conversation_id`, missing fields, a message over 4,000 characters, or a `conversation_id` over 100 characters.
 
 ### Project structure
 ```
 hisabdo-ai/
 ├── app/
 │   ├── main.py
+│   ├── config.py
+│   ├── logging_config.py
 │   ├── api/chat.py
 │   ├── services/
+│   │   ├── chat_service.py
 │   │   ├── llm_service.py
+│   │   ├── conversation_store.py
 │   │   ├── context_service.py
 │   │   ├── kb_service.py
 │   │   ├── rag_service.py
 │   │   └── evaluation_service.py
 │   └── prompts/system_prompt.py
-├── tests/test_api.py
+├── tests/ (conftest.py, test_chat_flow.py, test_providers.py)
 ├── .env            (local only, never committed)
 ├── .env.example
 ├── .gitignore
@@ -225,6 +270,16 @@ copy .env.example .env         # then put your own key in .env
 uvicorn app.main:app --reload
 ```
 Open `http://127.0.0.1:8000/docs` to try both endpoints. Run the tests with `pytest`.
+
+**Settings** (environment variables, see `.env.example`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GEMINI_API_KEY` | none | Provider key. Without it the mock provider is used |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Model name (see the note in 3.4) |
+| `LLM_PROVIDER` | `auto` | `auto`, `gemini` or `mock` |
+| `LLM_TIMEOUT_SECONDS` | `20` | Provider call timeout |
+| `HISTORY_MAX_MESSAGES` | `20` | Messages kept per conversation |
 
 **Functional when:** the service starts, `/health` returns `{"status":"ok"}`, and `/api/chat` accepts a valid request and returns a structured response.
 
@@ -247,16 +302,21 @@ Open `http://127.0.0.1:8000/docs` to try both endpoints. Run the tests with `pyt
 
 API correctness and AI answer quality are tested separately.
 
-### 8.1 Automated checks (in `tests/test_api.py`) ✅
+### 8.1 Automated checks (in `tests/`) ✅
 
-| Test | Expected |
+All tests run with no real key and make no real AI calls. A fake provider records what reaches the LLM.
+
+| Area | What is checked |
 |---|---|
-| `GET /health` | 200, `{"status":"ok"}` |
-| Valid `POST /api/chat` | 200, response has `conversation_id` and `message` |
-| Empty, blank or too-long message; missing or empty `conversation_id`; empty body | 422 |
-| Model failure (simulated) | 200 with safe fallback text, no key or error details in the response |
-
-Tests use no real key and make no real AI calls.
+| Full flow | User request, API, LLM, then response with the stable schema; configured timeout reaches the provider |
+| System prompt | The HisabDo system prompt is sent on every call |
+| Context | History is preserved across turns, isolated per conversation, capped, and a failed turn is not stored |
+| Errors | Timeout, rate limit, provider error, malformed reply and an unexpected provider bug each return a clear fallback with the right `error_code`; the service recovers on the next request |
+| Validation | Empty, blank, missing, oversize and malformed requests return 422 and never reach the LLM |
+| Logging | Success and failure logs carry ids, sizes and codes, and never message text or secrets |
+| Gemini provider | Google 429 maps to rate limit, 408/504 and network timeouts map to timeout, other errors map to provider error, empty replies map to malformed reply; error text never contains the key; seconds convert to milliseconds |
+| Provider factory | Chooses Gemini, mock or a safe mock fallback correctly |
+| Safety net | An unhandled bug returns a generic 500 with no details |
 
 ### 8.2 Manual and quality validation for the SQA team
 
@@ -287,6 +347,7 @@ Tests use no real key and make no real AI calls.
 | Phase | Content |
 |---|---|
 | **Oct 5 (this deliverable)** | Architecture doc, `/health`, `/api/chat`, validation, safe logging, tests |
+| **Chat service and LLM integration** | Service layer, provider-agnostic interface, system prompt, history, error handling, structured logs, flow tests |
 | Next | Real context builder, auth, conversation history |
 | Then | KB ingestion + embeddings + vector store + RAG |
 | Then | Agent router, Content Assistant, Insights Engine |
@@ -301,3 +362,8 @@ Tests use no real key and make no real AI calls.
 - [x] Agent workflow, Content Assistant and Insights Engine outlined
 - [x] SQA validation approach defined
 - [x] No real secrets in source control
+- [x] Chat requests reach the LLM through a reusable service layer, with the system prompt applied on every call
+- [x] Stable response schema; conversation context preserved
+- [x] Timeout, rate-limit, provider and malformed-reply failures return clear fallbacks
+- [x] Logs support debugging without keys or message content
+- [x] User, API, LLM and response flow covered by tests

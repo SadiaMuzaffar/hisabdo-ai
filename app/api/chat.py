@@ -1,7 +1,10 @@
-from fastapi import APIRouter
+from dataclasses import asdict
+from typing import Literal
+
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
 
-from app.services import context_service, evaluation_service, llm_service, rag_service
+from app.services.chat_service import ChatService, get_chat_service
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -10,24 +13,22 @@ class ChatRequest(BaseModel):
     conversation_id: str = Field(..., min_length=1, max_length=100)
     message: str = Field(..., min_length=1, max_length=4000)
 
-    @field_validator("message")
+    @field_validator("conversation_id", "message")
     @classmethod
-    def message_not_blank(cls, v: str) -> str:
+    def not_blank(cls, v: str) -> str:
         if not v.strip():
-            raise ValueError("message must not be blank")
+            raise ValueError("must not be blank")
         return v
 
 
 class ChatResponse(BaseModel):
     conversation_id: str
     message: str
+    status: Literal["ok", "fallback"] = "ok"
+    error_code: str | None = None
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
-    """Chat flow: validate -> context -> KB/RAG -> LLM -> log -> respond."""
-    context = context_service.build_context(req.conversation_id)
-    chunks = rag_service.retrieve(req.message)
-    reply, ok = llm_service.generate_reply(req.message, context, chunks)
-    evaluation_service.record_interaction(req.conversation_id, len(req.message), bool(chunks), ok)
-    return ChatResponse(conversation_id=req.conversation_id, message=reply)
+def chat(req: ChatRequest, service: ChatService = Depends(get_chat_service)) -> ChatResponse:
+    """Send a message. Provider failures return 200 with status "fallback", never a stack trace."""
+    return ChatResponse(**asdict(service.handle(req.conversation_id, req.message)))
